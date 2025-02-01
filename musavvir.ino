@@ -1,9 +1,11 @@
 #include <WiFi.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include<time.h>
 #include <FS.h>
 #include <WebServer.h>
 #include <Wire.h>                    
-#include <LiquidCrystal_I2C.h> 
+//#include <LiquidCrystal_I2C.h> 
 #include <Preferences.h>
 #include <Adafruit_Fingerprint.h>
 #include <SoftwareSerial.h>
@@ -21,11 +23,14 @@
 hd44780_I2Cexp lcd;
 RTC_DS3231 rtc;
 #define MAX_STUDENTS 100  // Adjust this based on the maximum number of students
+bool offlineDataSent = false;
 bool isFingerprintSensorOperational = true; // Flag to track sensor status
 bool isFingerprintEnabled = false;
+QueueHandle_t supabaseQueue = xQueueCreate(10, sizeof(String*));
 
 
-bool sendToSupabase(const char* table, const String& jsonData, const String& method = "POST", int teacherId = -1);
+// Remove default parameters from declaration
+bool sendToSupabase(const char* table, const String& jsonData, const String& method, int recordId);
 bool attendedStudentsarray[MAX_STUDENTS] = {false};  // Array to track attendance
 bool isAttendanceMode = false;
 
@@ -90,12 +95,20 @@ void handleUpdateTeacher();
 void handleUpdateStudent();
 void handleDeleteTeacher();
 void handleDeleteStudent();
-void handleAttendanceDetails();
-void handleAttendanceDetails1();
-void handleDateWiseDownload();
+void handleFileRequest();
+void handleSDDownloadAttendance();
+void handleSDDownloadStudents();
+void handleSDDownloadTeachers();
+void handleSDViewStudents();
+void handleSDViewTeachers();
+void handleSDImportStudents();
+void handleSDImportTeachers();
+
+
+
 void handleDownloadAttendanceByDate();
-void handleDownloadAttendance();
-void handleDownloadDateAttendance();
+
+
 void sendOfflineDataToSupabase();
 void handleDownloadOfflineData();
 void saveOfflineAttendance();
@@ -113,27 +126,9 @@ void handleEditTeacher() {
     <html>
     <head>
         <style>
-            table {
-                width: 100%;
-                border-collapse: collapse;
-                margin-bottom: 20px;
-            }
-            th, td {
-                border: 1px solid #ddd;
-                padding: 8px;
-                text-align: left;
-            }
-            th {
-                background-color: #4CAF50;
-                color: white;
-            }
-            .edit-btn {
-                background-color: #4CAF50;
-                color: white;
-                padding: 5px 10px;
-                border: none;
-                cursor: pointer;
-            }
+            table { width: 100%; border-collapse: collapse; margin-bottom: 20px; }
+            th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+            th { background-color: #4CAF50; color: white; }
             .delete-btn {
                 background-color: #f44336;
                 color: white;
@@ -141,13 +136,8 @@ void handleEditTeacher() {
                 border: none;
                 cursor: pointer;
             }
-            .container {
-                width: 80%;
-                margin: 0 auto;
-            }
-            h2 {
-                text-align: center;
-            }
+            .container { width: 80%; margin: 0 auto; }
+            h2 { text-align: center; }
         </style>
     </head>
     <body>
@@ -182,8 +172,7 @@ void handleEditTeacher() {
             String courseCode = line.substring(thirdComma + 1);
 
             htmlPage += "<tr><td>" + id + "</td><td>" + name + "</td><td>" + courseName + "</td><td>" + courseCode + 
-                        "</td><td><button class='edit-btn' onclick='editTeacher(\"" + id + "\", \"" + name + "\", \"" + courseName + "\", \"" + courseCode + 
-                        "\")'>Edit</button> <button class='delete-btn' onclick='deleteTeacher(\"" + id + 
+                        "</td><td><button class='delete-btn' onclick='deleteTeacher(\"" + id + 
                         "\")'>Delete</button></td></tr>";
         }
     }
@@ -192,15 +181,6 @@ void handleEditTeacher() {
     htmlPage += R"rawliteral(
             </table>
             <script>
-                function editTeacher(id, name, courseName, courseCode) {
-                    let newName = prompt("Enter new name:", name);
-                    let newCourseName = prompt("Enter new course name:", courseName);
-                    let newCourseCode = prompt("Enter new course code:", courseCode);
-                    if (newName && newCourseName && newCourseCode) {
-                        // Use encodeURIComponent to ensure special characters are handled correctly
-                        window.location.href = `/updateTeacher?id=${id}&name=${encodeURIComponent(newName)}&courseName=${encodeURIComponent(newCourseName)}&courseCode=${encodeURIComponent(newCourseCode)}`;
-                    }
-                }
                 function deleteTeacher(id) {
                     if (confirm("Are you sure you want to delete this teacher?")) {
                         window.location.href = `/deleteTeacher?id=${id}`;
@@ -273,59 +253,69 @@ void handleUpdateTeacher() {
 }
 //3 delete
 void handleDeleteTeacher() {
-    if (!authenticateUser()) {
-        return;
-    }
+    if (!authenticateUser()) return;
 
     String id = server.arg("id");
+    if (id.isEmpty()) {
+        server.send(400, "text/html", "Error: Invalid ID");
+        return;
+    }
 
-    // Open the teacher data file and check for successful opening
+    // 1. Delete from SPIFFS
+    bool deleted = false;
     File oldFile = SPIFFS.open(teacherDataFile, "r");
-    if (!oldFile) {
-        server.send(500, "text/html", "Error reading teacher data.");
+    File newFile = SPIFFS.open("/temp_teachers.csv", "w");
+
+    if (!oldFile || !newFile) {
+        server.send(500, "text/html", "Error: File Access Failed");
+        if (oldFile) oldFile.close();
+        if (newFile) newFile.close();
         return;
     }
 
-    // Create a new temporary file for storing data after deletion
-    File newFile = SPIFFS.open("/temp.csv", "w");
-    if (!newFile) {
-        oldFile.close();
-        server.send(500, "text/html", "Error creating temporary file.");
-        return;
-    }
-
-    bool found = false;  // Flag to track if the teacher ID was found and deleted
-
-    // Read each line and write back to the new file, skipping the teacher to be deleted
     while (oldFile.available()) {
         String line = oldFile.readStringUntil('\n');
-        line.trim();  // Clean up any unnecessary whitespace
-        
-        // Check if the line starts with the ID to delete
-        if (line.startsWith(id + ",")) {
-            found = true;  // Mark as found, will not write this line to the new file
+        if (!line.startsWith(id + ",")) {
+            newFile.println(line);
         } else {
-            newFile.println(line);  // Keep the record if it doesn't match
+            deleted = true;
         }
     }
 
     oldFile.close();
     newFile.close();
 
-    // If the teacher ID wasn't found, notify the user
-    if (!found) {
-        SPIFFS.remove("/temp.csv");
-        server.send(404, "text/html", "Teacher ID not found.");
-        return;
+    if (deleted) {
+        SPIFFS.remove(teacherDataFile);
+        if (!SPIFFS.rename("/temp_teachers.csv", teacherDataFile)) {
+            SPIFFS.remove("/temp_teachers.csv");
+            server.send(500, "text/html", "Error: Update Failed");
+            return;
+        }
+    } else {
+        SPIFFS.remove("/temp_teachers.csv");
     }
 
-    // Replace the old file with the new file
-    SPIFFS.remove(teacherDataFile);
-    SPIFFS.rename("/temp.csv", teacherDataFile);
-
-    // Redirect to the teacher edit page with a success message
-    server.sendHeader("Location", "/editTeacher?status=deleted");
+    // 2. Send response IMMEDIATELY
+    server.sendHeader("Location", "/editTeacher?deleted=" + String(deleted ? "1" : "0"));
     server.send(303);
+
+    // 3. Sync with Supabase in background (FreeRTOS task)
+    if (deleted && WiFi.status() == WL_CONNECTED) {
+        xTaskCreate(
+            [](void* param) {
+                String* id = (String*)param;
+                sendToSupabase("teachers", "", "DELETE", id->toInt());
+                delete id;
+                vTaskDelete(NULL);
+            },
+            "supabase_delete_teacher",
+            4096,
+            new String(id),
+            1,
+            NULL
+        );
+    }
 }
 
 // 4
@@ -342,46 +332,18 @@ void handleEditStudent() {
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Edit Students</title>
         <style>
-            body {
-                font-family: Arial, sans-serif;
-                background-color: #f4f4f4;
-                margin: 0;
-                padding: 20px;
-            }
-            table {
-                width: 100%;
-                border-collapse: collapse;
-                margin-bottom: 20px;
-            }
-            th, td {
-                border: 1px solid #ddd;
-                padding: 8px;
-                text-align: left;
-            }
-            th {
-                background-color: #4CAF50;
-                color: white;
-            }
-            .edit-btn, .delete-btn {
-                padding: 5px 10px;
-                border: none;
-                cursor: pointer;
-                font-size: 14px;
-            }
-            .edit-btn {
-                background-color: #4CAF50;
-                color: white;
-            }
+            body { font-family: Arial, sans-serif; background-color: #f4f4f4; margin: 0; padding: 20px; }
+            table { width: 100%; border-collapse: collapse; margin-bottom: 20px; }
+            th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+            th { background-color: #4CAF50; color: white; }
             .delete-btn {
                 background-color: #f44336;
                 color: white;
+                padding: 5px 10px;
+                border: none;
+                cursor: pointer;
             }
-            .edit-btn:hover, .delete-btn:hover {
-                opacity: 0.8;
-            }
-            h2 {
-                color: #333;
-            }
+            h2 { color: #333; }
         </style>
     </head>
     <body>
@@ -398,14 +360,12 @@ void handleEditStudent() {
             <tbody>
     )rawliteral";
 
-    // Open student data file
     File file = SPIFFS.open(studentDataFile, "r");
     if (!file) {
         server.send(500, "text/html", "Error reading student data.");
         return;
     }
 
-    // Loop through the file lines and add student data to the table
     while (file.available()) {
         String line = file.readStringUntil('\n');
         line.trim();
@@ -417,8 +377,7 @@ void handleEditStudent() {
             String rollNumber = line.substring(lastComma + 1);
 
             htmlPage += "<tr><td>" + id + "</td><td>" + name + "</td><td>" + rollNumber + 
-                        "</td><td><button class='edit-btn' onclick='editStudent(\"" + id + "\", \"" + name + "\", \"" + rollNumber + 
-                        "\")'>Edit</button> <button class='delete-btn' onclick='deleteStudent(\"" + id + 
+                        "</td><td><button class='delete-btn' onclick='deleteStudent(\"" + id + 
                         "\")'>Delete</button></td></tr>";
         }
     }
@@ -429,14 +388,6 @@ void handleEditStudent() {
             </tbody>
         </table>
         <script>
-            function editStudent(id, name, rollNumber) {
-                let newName = prompt("Enter new name:", name);
-                let newRollNumber = prompt("Enter new roll number:", rollNumber);
-                if (newName && newRollNumber) {
-                    window.location.href = `/updateStudent?id=${id}&name=${encodeURIComponent(newName)}&rollNumber=${encodeURIComponent(newRollNumber)}`;
-                }
-            }
-
             function deleteStudent(id) {
                 if (confirm("Are you sure you want to delete this student?")) {
                     window.location.href = `/deleteStudent?id=${id}`;
@@ -447,7 +398,6 @@ void handleEditStudent() {
     </html>
     )rawliteral";
 
-    // Send the HTML response
     server.send(200, "text/html", htmlPage);
 }
 
@@ -522,73 +472,71 @@ void handleUpdateStudent() {
 }
 
 //6
-
 void handleDeleteStudent() {
-    if (!authenticateUser()) {
-        return;
-    }
+    if (!authenticateUser()) return;
 
     String id = server.arg("id");
-    
-    // Open the old file for reading
-    File oldFile = SPIFFS.open(studentDataFile, "r");
-    if (!oldFile) {
-        Serial.println("Failed to open the student data file for reading.");
-        server.send(500, "text/html", "Failed to read student data.");
+    if (id.isEmpty()) {
+        server.send(400, "text/html", "Error: Invalid ID");
         return;
     }
 
-    // Create a new file to store the updated data
-    File newFile = SPIFFS.open("/temp.csv", "w");
-    if (!newFile) {
-        Serial.println("Failed to open the temp file for writing.");
-        oldFile.close();
-        server.send(500, "text/html", "Failed to update student data.");
-        return;
-    }
-
+    // 1. Delete from SPIFFS
     bool deleted = false;
+    File oldFile = SPIFFS.open(studentDataFile, "r");
+    File newFile = SPIFFS.open("/temp_students.csv", "w");
+
+    if (!oldFile || !newFile) {
+        server.send(500, "text/html", "Error: File Access Failed");
+        if (oldFile) oldFile.close();
+        if (newFile) newFile.close();
+        return;
+    }
+
     while (oldFile.available()) {
         String line = oldFile.readStringUntil('\n');
-        
-        // If the line starts with the student ID, skip it (deleting the student)
-        if (line.startsWith(id + ",")) {
-            deleted = true; // Mark that we found and deleted the student
-        } else {
+        if (!line.startsWith(id + ",")) {
             newFile.println(line);
+        } else {
+            deleted = true;
         }
     }
 
     oldFile.close();
     newFile.close();
 
-    // Check if the student was deleted
-    if (!deleted) {
-        Serial.println("Student ID not found.");
-        server.send(404, "text/html", "Student not found.");
-        return;
-    }
-
-    // Replace the old file with the updated file
-    if (SPIFFS.remove(studentDataFile)) {
-        if (SPIFFS.rename("/temp.csv", studentDataFile)) {
-            Serial.println("Student deleted successfully.");
-        } else {
-            Serial.println("Failed to rename the temp file.");
-            server.send(500, "text/html", "Failed to update student data.");
+    if (deleted) {
+        SPIFFS.remove(studentDataFile);
+        if (!SPIFFS.rename("/temp_students.csv", studentDataFile)) {
+            SPIFFS.remove("/temp_students.csv");
+            server.send(500, "text/html", "Error: Update Failed");
             return;
         }
     } else {
-        Serial.println("Failed to remove the old student data file.");
-        server.send(500, "text/html", "Failed to update student data.");
-        return;
+        SPIFFS.remove("/temp_students.csv");
     }
 
-    // Redirect to the edit student page after deletion
-    server.sendHeader("Location", "/editStudent");
+    // 2. Send response IMMEDIATELY
+    server.sendHeader("Location", "/editStudent?deleted=" + String(deleted ? "1" : "0"));
     server.send(303);
-}
 
+    // 3. Sync with Supabase in background (FreeRTOS task)
+    if (deleted && WiFi.status() == WL_CONNECTED) {
+        xTaskCreate(
+            [](void* param) {
+                String* id = (String*)param;
+                sendToSupabase("students", "", "DELETE", id->toInt());
+                delete id;
+                vTaskDelete(NULL);
+            },
+            "supabase_delete_student",
+            4096,
+            new String(id),
+            1,
+            NULL
+        );
+    }
+}
 //7
 
 bool initializeFingerprint() {
@@ -632,46 +580,39 @@ bool initializeFingerprint() {
 
 //8
 
-bool sendToSupabase(const char* table, const String& jsonData, const String& method, int teacherId) {
+bool sendToSupabase(const char* table, const String& jsonData, const String& method, int recordId) {
     HTTPClient http;
+    http.setTimeout(10000); // 10-second timeout
+
     String url = String(SUPABASE_URL) + "/rest/v1/" + table;
 
-    // Add WHERE clause for PATCH method with teacher_id
-    if (method == "PATCH" && teacherId != -1) {
-        url += "?teacher_id=eq." + String(teacherId); // Append WHERE clause for teacher_id
+    // Build Supabase query URL
+    if (method == "DELETE" || method == "PATCH") {
+        if (String(table) == "teachers") {
+            url += "?teacher_id=eq." + String(recordId);
+        } else if (String(table) == "students") {
+            url += "?student_id=eq." + String(recordId);
+        }
     }
 
-    // Initialize HTTP request
     http.begin(url);
-    http.addHeader("apikey", SUPABASE_KEY);  // API Key for authentication
-    http.addHeader("Authorization", "Bearer " + String(SUPABASE_KEY));  // Bearer token for authentication
-    http.addHeader("Content-Type", "application/json");  // Content-Type header for JSON payload
-    http.addHeader("Prefer", "return=minimal");  // Minimize response data (for PATCH/DELETE)
+    http.addHeader("apikey", SUPABASE_KEY);
+    http.addHeader("Authorization", "Bearer " + String(SUPABASE_KEY));
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("Prefer", "return=minimal");
 
-    // Send request based on the method (POST, PATCH, DELETE)
     int httpCode = 0;
     if (method == "DELETE") {
-        httpCode = http.sendRequest("DELETE", jsonData);  // Send DELETE request
+        httpCode = http.sendRequest("DELETE", jsonData);
     } else if (method == "PATCH") {
-        httpCode = http.sendRequest("PATCH", jsonData);   // Send PATCH request
+        httpCode = http.sendRequest("PATCH", jsonData);
     } else {
-        httpCode = http.POST(jsonData);                   // Default to POST request
+        httpCode = http.POST(jsonData);
     }
 
-    // Log HTTP response code and body for debugging
-    String response = http.getString();
-    Serial.println("HTTP Code: " + String(httpCode));
-    Serial.println("Response: " + response);
+    bool success = (httpCode == 200 || httpCode == 201 || httpCode == 204);
+    http.end(); // Ensure connection is closed
 
-    // Check if the request was successful (200 or 201)
-    bool success = (httpCode == 200 || httpCode == 201);
-    if (!success) {
-        // Log detailed error message if the request failed
-        Serial.println("Error sending to Supabase: " + response);
-    }
-
-    // Clean up and close the HTTP connection
-    http.end();
     return success;
 }
 
@@ -802,6 +743,7 @@ bool connectToWiFi(const char* ssid, const char* password) {
     lcd.setCursor(0, 1);
     lcd.print(WiFi.localIP().toString());
 
+    // Check if serial number exists and update the IP or add a new entry
     String serial = "1";  // Unique serial number (set according to your system)
     String ip = WiFi.localIP().toString();
 
@@ -820,11 +762,15 @@ bool connectToWiFi(const char* ssid, const char* password) {
         String jsonString;
         serializeJson(doc, jsonString);
 
-        if (!sendToSupabase("ips", jsonString)) {
+        if (!sendToSupabase("ips", jsonString, "POST", -1)) {
             Serial.println("Failed to send IP address to Supabase");
             return false;
         }
     }
+
+    // Send offline data after connecting to Wi-Fi
+    sendOfflineDataToSupabase();
+    offlineDataSent = true; // Set the flag to true after sending
 
     return true;
 }
@@ -835,39 +781,34 @@ bool connectToWiFi(const char* ssid, const char* password) {
 void startAccessPoint(const String& apSSID = "ESP32_Config", const String& apPassword = "123456789") {
     // Set Wi-Fi mode to Access Point (AP)
     WiFi.mode(WIFI_AP);
-    WiFi.softAP(apSSID.c_str(), apPassword.c_str());
     
-    // Verify if the AP is started successfully
-    if (WiFi.softAPgetStationNum() == 0) {
-        Serial.println("Error: Failed to start Access Point.");
+    // Attempt to start the Access Point
+    if (WiFi.softAP(apSSID.c_str(), apPassword.c_str())) {
+        Serial.println("Access Point Started"); // Log success
+        IPAddress apIP = WiFi.softAPIP(); // Get the IP address of the AP
+        Serial.print("AP IP Address: ");
+        Serial.println(apIP);
+        
+        // Display on LCD
+        lcd.clear(); // Clear the LCD
+        lcd.setCursor(0, 0); // Set cursor to the first row
+        lcd.print("AP Started");
+        lcd.setCursor(0, 1); // Set cursor to the second row
+        lcd.print("IP: ");
+        lcd.print(apIP); // Display the actual IP address
+
+        // Optionally, print the number of connected clients to serial monitor
+        int numClients = WiFi.softAPgetStationNum();
+        Serial.print("Number of clients connected: ");
+        Serial.println(numClients);
+    } else {
+        Serial.println("Error: Failed to start Access Point."); // Log the error
         lcd.clear();
         lcd.setCursor(0, 0);
         lcd.print("AP Start Failed");
         lcd.setCursor(0, 1);
         lcd.print("Please try again");
-        return; // Exit if AP mode failed to start
     }
-
-    Serial.println("Access Point Started");
-
-    // Get the IP address of the access point
-    IPAddress apIP = WiFi.softAPIP();
-    
-    Serial.print("AP IP Address: ");
-    Serial.println(apIP);
-    
-    // Display on LCD
-    lcd.clear(); // Clear the LCD
-    lcd.setCursor(0, 0); // Set cursor to the first row
-    lcd.print("AP Started");
-    lcd.setCursor(0, 1); // Set cursor to the second row
-    lcd.print("IP: ");
-    lcd.print(apIP); // Display the actual IP address
-
-    // Optionally, print the number of connected clients to serial monitor
-    int numClients = WiFi.softAPgetStationNum();
-    Serial.print("Number of clients connected: ");
-    Serial.println(numClients);
 }
 
 //13
@@ -898,223 +839,239 @@ bool authenticateUser() {
 
 //14
 void handleRoot() {
-    if (!authenticateUser()) {
-        return;
-    }
+    if (!authenticateUser()) return;
 
-    String wifiStatus = "Not connected";
-    if (WiFi.status() == WL_CONNECTED) {
-        wifiStatus = WiFi.SSID();
-    }
+    String wifiStatus = (WiFi.status() == WL_CONNECTED) ? 
+                   "<i class='fas fa-wifi' style='color:#4CAF50'></i> Connected (" + WiFi.SSID() + ")" : 
+                   "<i class='fas fa-wifi-slash' style='color:#f44336'></i> Offline";
 
-    String htmlPage = R"rawliteral(
+    String html = R"rawliteral(
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Admin Dashboard</title>
+        <title>JUST Attendance System</title>
         <style>
+            :root {
+                --primary: #2c3e50;
+                --secondary: #3498db;
+                --accent: #e74c3c;
+                --background: #f8f9fa;
+            }
+
             body {
-                font-family: 'Arial', sans-serif;
                 margin: 0;
-                padding: 0;
-                background: linear-gradient(to right, #74ebd5, #acb6e5);
-                display: flex;
-                justify-content: center;
-                align-items: center;
-                height: 100vh;
+                padding: 20px;
+                font-family: 'Segoe UI', system-ui;
+                background: linear-gradient(135deg, #ece9e6, #ffffff);
+                min-height: 100vh;
             }
 
-            .dashboard-container {
-                width: 90%;
-                height: 90%;
-                display: flex;
-                flex-direction: column;
-                justify-content: flex-start;
-                align-items: center;
-                background: white;
-                border-radius: 16px;
-                box-shadow: 0 8px 40px rgba(0, 0, 0, 0.2);
+            .dashboard {
+                max-width: 1200px;
+                margin: 0 auto;
+                background: rgba(255, 255, 255, 0.95);
+                backdrop-filter: blur(10px);
+                border-radius: 20px;
+                box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
                 padding: 30px;
-                position: relative;
             }
 
-            .university-logo {
-                width: 250px;
-                height: auto;
-                margin-bottom: 20px;
-                transition: transform 0.3s;
-            }
-
-            .university-logo:hover {
-                transform: scale(1.15);
-            }
-
-            .header-text {
-                font-size: 36px;
-                margin-bottom: 10px;
-                color: #2c3e50;
-                font-weight: bold;
+            .header {
                 text-align: center;
-                letter-spacing: 1px;
-                text-shadow: 2px 2px 10px rgba(0, 0, 0, 0.1);
-            }
-
-            .project-info {
-                font-size: 20px;
-                color: #555;
+                padding: 20px;
+                border-bottom: 2px solid var(--primary);
                 margin-bottom: 30px;
-                text-align: center;
-                letter-spacing: 1px;
             }
 
-            .wifi-status {
-                margin-bottom: 20px;
-                padding: 15px;
-                background: #f9f9f9;
-                border: 1px solid #ddd;
-                border-radius: 6px;
-                font-size: 18px;
-                width: 60%;
-                text-align: center;
-                box-shadow: 0 4px 10px rgba(0, 0, 0, 0.1);
+            .logo {
+                height: 80px;
+                margin-bottom: 15px;
+                filter: drop-shadow(0 2px 4px rgba(0,0,0,0.1));
             }
 
-            .menu-container {
-                display: flex;
-                flex-wrap: wrap;
-                justify-content: center;
-                gap: 15px;
-                width: 100%;
-                max-width: 900px;
-                margin-bottom: 20px;
+            .grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+                gap: 25px;
+                padding: 20px;
             }
 
-            .menu-button, .dropbtn, .delete-button {
-                font-size: 18px;
-                padding: 15px 30px;
-                border: none;
-                border-radius: 8px;
-                color: white;
-                text-decoration: none;
-                cursor: pointer;
+            .card {
+                background: white;
+                border-radius: 15px;
+                padding: 25px;
                 transition: transform 0.3s, box-shadow 0.3s;
-                text-align: center;
-                letter-spacing: 1px;
+                border: 1px solid rgba(0,0,0,0.1);
             }
 
-            .menu-button {
-                background-color: #4caf50;
-                box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
-                width: 200px;
+            .card:hover {
+                transform: translateY(-5px);
+                box-shadow: 0 8px 25px rgba(0, 0, 0, 0.1);
             }
 
-            .menu-button:hover {
-                background-color: #45a049;
-                transform: scale(1.05);
+            .card-title {
+                font-size: 1.4em;
+                color: var(--primary);
+                margin-bottom: 15px;
+                display: flex;
+                align-items: center;
+                gap: 10px;
             }
 
-            .dropbtn {
-                background-color: #2196f3;
-                width: 200px;
-                box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+            .card-icon {
+                font-size: 1.6em;
+                color: var(--secondary);
             }
 
-            .dropbtn:hover {
-                background-color: #1e88e5;
-                transform: scale(1.05);
-            }
-
-            .dropdown-content {
-                display: none;
-                position: absolute;
-                background-color: white;
-                box-shadow: 0 8px 16px rgba(0, 0, 0, 0.2);
-                border-radius: 6px;
-                z-index: 1;
-                min-width: 160px;
-            }
-
-            .dropdown-content a {
-                padding: 12px 16px;
-                display: block;
+            .menu-item {
+                display: flex;
+                align-items: center;
+                padding: 12px 20px;
+                margin: 8px 0;
+                border-radius: 10px;
+                background: #f8f9fa;
+                transition: all 0.2s;
                 text-decoration: none;
-                color: #333;
-                font-size: 16px;
-                border-bottom: 1px solid #f1f1f1;
+                color: var(--primary);
+                gap: 12px;
             }
 
-            .dropdown-content a:hover {
-                background-color: #f1f1f1;
+            .menu-item:hover {
+                background: var(--secondary);
+                color: white !important;
+                transform: translateX(5px);
             }
 
-            .dropdown:hover .dropdown-content {
-                display: block;
-            }
-
-            .delete-button {
-                background-color: #ff4444;
-                width: 240px;
-                font-size: 20px;
-                padding: 18px 35px;
-                margin-top: 30px;
-                box-shadow: 0 4px 10px rgba(255, 0, 0, 0.2);
+            .menu-item i {
+                width: 25px;
                 text-align: center;
             }
 
-            .delete-button:hover {
-                background-color: #ff6b6b;
-                transform: scale(1.1);
+            .status-bar {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                background: var(--primary);
+                color: white;
+                padding: 15px 30px;
+                border-radius: 12px;
+                margin-bottom: 30px;
             }
 
-            @media (max-width: 480px) {
-                .menu-container {
-                    flex-direction: column;
-                }
-
-                .menu-button, .dropbtn, .delete-button {
-                    width: 90%;
-                    margin-bottom: 10px;
-                }
+            .danger-zone {
+                border: 2px solid var(--accent);
+                border-radius: 15px;
+                padding: 20px;
+                margin-top: 30px;
+                background: #fff5f5;
             }
         </style>
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     </head>
     <body>
-        <div class="dashboard-container">
-            <img src="https://just.edu.bd/logo/download.png" alt="JUST Logo" class="university-logo">
-            <h1 class="header-text">Jashore University of Science and Technology</h1>
-            <p class="project-info">Department of Electrical and Electronic Engineering<br>Project by Musavvir,Rifat,Tanim,Pitom</p>
-            <p class="wifi-status">Current Wi-Fi Status: )rawliteral" + wifiStatus + R"rawliteral(</p>
-            <div class="menu-container">
-                <div class="dropdown">
-                    <button class="dropbtn">Teacher</button>
-                    <div class="dropdown-content">
-                        <a href="/enrollTeacher">Enroll Teacher</a>
-                        <a href="/downloadTeachers">Download Teacher Data</a>
-                        <a href="/editTeacher">Edit Teachers</a>
-                    </div>
-                </div>
-                <div class="dropdown">
-                    <button class="dropbtn">Student</button>
-                    <div class="dropdown-content">
-                        <a href="/enrollStudent">Enroll Student</a>
-                        <a href="/downloadStudents">Download Student Data</a>
-                        <a href="/editStudent">Edit Students</a>
-                    </div>
-                </div>
-                <a href="/downloadAttendance" class="menu-button">View Attendance</a>
-                <a href="/wifi" class="menu-button" onmouseover="this.style.transform='scale(1.05)'" onmouseout="this.style.transform='scale(1)'">Change Wi-Fi Settings</a>
+        <div class="dashboard">
+            <div class="header">
+                <img src="https://just.edu.bd/logo/download.png" class="logo" alt="JUST Logo">
+                <h1>Smart Attendance System</h1>
+                <p>Department of EEE - Developed by Musavvir, Rifat, Tanim, Pitom</p>
             </div>
-            <a href="/deleteAllFiles" 
-               class="delete-button"
-               onclick="return confirm('This action will permanently delete all CSV files. Proceed?')">
-               Delete All CSV Files
-            </a>
+
+            <div class="status-bar">
+                <div><i class="fas fa-wifi"></i> Network Status: %WIFI_STATUS%</div>
+                <div><i class="fas fa-microchip"></i> ESP32 | Free Memory: %HEAP% bytes</div>
+            </div>
+
+            <div class="grid">
+                <!-- Teachers Card -->
+                <div class="card">
+                    <div class="card-title">
+                        <i class="card-icon fas fa-chalkboard-teacher"></i>
+                        Teacher Management
+                    </div>
+                    <a href="/enrollTeacher" class="menu-item">
+                        <i class="fas fa-fingerprint"></i> Enroll Teacher
+                    </a>
+                    <a href="/editTeacher" class="menu-item">
+                        <i class="fas fa-edit"></i> Edit Teachers
+                    </a>
+                    <a href="/downloadTeachers" class="menu-item">
+                        <i class="fas fa-download"></i> Download Data
+                    </a>
+                </div>
+
+                <!-- Students Card -->
+                <div class="card">
+                    <div class="card-title">
+                        <i class="card-icon fas fa-user-graduate"></i>
+                        Student Management
+                    </div>
+                    <a href="/enrollStudent" class="menu-item">
+                        <i class="fas fa-fingerprint"></i> Enroll Student
+                    </a>
+                    <a href="/editStudent" class="menu-item">
+                        <i class="fas fa-edit"></i> Edit Students
+                    </a>
+                    <a href="/downloadStudents" class="menu-item">
+                        <i class="fas fa-download"></i> Download Data
+                    </a>
+                </div>
+
+                <!-- SD Card Management -->
+                <div class="card">
+                    <div class="card-title">
+                        <i class="card-icon fas fa-sd-card"></i>
+                        SD Card Operations
+                    </div>
+                    <div class="sub-grid">
+                        <a href="/sdImportTeachers" class="menu-item">
+                            <i class="fas fa-file-import"></i> Import Teachers
+                        </a>
+                        <a href="/sdImportStudents" class="menu-item">
+                            <i class="fas fa-file-import"></i> Import Students
+                        </a>
+                        <a href="/sdDownloadAttendance" class="menu-item">
+                            <i class="fas fa-history"></i> Full Attendance
+                        </a>
+                    </div>
+                </div>
+
+                <!-- System Card -->
+                <div class="card">
+                    <div class="card-title">
+                        <i class="card-icon fas fa-cogs"></i>
+                        System Configuration
+                    </div>
+                    <a href="/wifi" class="menu-item">
+                        <i class="fas fa-wifi"></i> Network Settings
+                    </a>
+                    <a href="/update" class="menu-item">
+                        <i class="fas fa-sync"></i> Firmware Update
+                    </a>
+                    <a href="/stats" class="menu-item">
+                        <i class="fas fa-chart-bar"></i> System Statistics
+                    </a>
+                </div>
+            </div>
+
+            <div class="danger-zone">
+                <h3 style="color: var(--accent); margin-top: 0;">
+                    <i class="fas fa-exclamation-triangle"></i> Danger Zone
+                </h3>
+                <a href="/deleteAllFiles" class="menu-item" 
+                   onclick="return confirm('This will permanently delete ALL data! Continue?')">
+                    <i class="fas fa-trash"></i> Purge All Data
+                </a>
+            </div>
         </div>
     </body>
     </html>
     )rawliteral";
 
-    server.send(200, "text/html", htmlPage);
+    // Dynamic content replacement
+    html.replace("%WIFI_STATUS%", wifiStatus);
+    html.replace("%HEAP%", String(ESP.getFreeHeap()));
+
+    server.send(200, "text/html", html);
 }
 //15
 
@@ -1286,6 +1243,10 @@ void handleEnrollTeacher() {
   if (!authenticateUser()) {
     return;
   }
+  if (WiFi.status() != WL_CONNECTED) {
+        server.send(400, "text/html", "<h2>Error: Cannot enroll teacher while offline.</h2>");
+        return;
+    }
 
   String htmlPage = R"rawliteral(
     <!DOCTYPE html>
@@ -1364,122 +1325,81 @@ void handleEnrollTeacher() {
 //18
 
 // Enroll a teacher and take attendance
-void enrollTeacher(int teacherId, const String& teacherName, const String& courseName, const String& coursecode) {
-    // Initialize the fingerprint sensor
-    if (!initializeFingerprint()) {
-        lcd.clear();
-        lcd.setCursor(0, 0);
-        lcd.print("Sensor Error!");
-        lcd.setCursor(0, 1);
-        lcd.print("Try Again Later");
-        delay(3000);
-        return;
-    }
-
-    // Display initial message
+void enrollTeacher(int teacherId, const String& teacherName, 
+                  const String& courseName, const String& coursecode) {
     lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("Enrolling Teacher");
+    lcd.print("Enroll Teacher");
     lcd.setCursor(0, 1);
     lcd.print("ID: " + String(teacherId));
     delay(2000);
 
-    // Start fingerprint enrollment process
-    Serial.print("Starting enrollment for Teacher ID: ");
-    Serial.println(teacherId);
-
-    // Directly initialize the fingerprint sensor
-    mySerial.begin(57600);
-    delay(1000);
-    finger.begin(57600);
-
-    int status;
-
-    // Wait for the teacher's finger to be placed on the sensor
-    while ((status = finger.getImage()) != FINGERPRINT_OK) {
-        lcd.clear();
-        lcd.setCursor(0, 0);
-        lcd.print("Place your finger");
-        lcd.setCursor(0, 1);
-        lcd.print("on the sensor.");
-        delay(2000);
-        Serial.println("Place your finger on the sensor.");
-    }
-
-    // Capture the first fingerprint
-    Serial.println("Fingerprint image taken.");
-    if (finger.image2Tz(1) != FINGERPRINT_OK) {
-        Serial.println("Failed to create template for the first image.");
-        lcd.clear();
-        lcd.setCursor(0, 0);
-        lcd.print("Error creating");
-        lcd.setCursor(0, 1);
-        lcd.print("first template.");
-        delay(2000);
-        return;
-    }
-
-    // Prompt user for the same finger again
+    // Step 1: Initial Finger Placement
     lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("Place same finger");
+    lcd.print("Step 1/2");
     lcd.setCursor(0, 1);
-    lcd.print("on the sensor.");
+    lcd.print("Place finger");
+    while(finger.getImage() != FINGERPRINT_OK) {
+        delay(100);
+    }
+    
+    finger.image2Tz(1);
+    lcd.clear();
+    lcd.print("Scan 1/2 OK!");
+    lcd.setCursor(0, 1);
+    lcd.print("Remove finger");
     delay(2000);
-    Serial.println("Place the same finger again.");
 
-    // Wait for the second fingerprint
-    while ((status = finger.getImage()) != FINGERPRINT_OK) {
-        Serial.println("Waiting for second fingerprint image.");
+    // Wait for finger removal
+    while(finger.getImage() == FINGERPRINT_OK) {
+        lcd.clear();
+        lcd.print("Please remove");
+        lcd.setCursor(0, 1);
+        lcd.print("your finger");
+        delay(500);
+    }
+
+    // Step 2: Second Finger Placement
+    lcd.clear();
+    lcd.print("Step 2/2");
+    lcd.setCursor(0, 1);
+    lcd.print("Same finger");
+    delay(1000);
+    
+    int retry = 0;
+    while(retry < 3) {
+        lcd.clear();
+        lcd.print("Place finger");
+        lcd.setCursor(0, 1);
+        lcd.print("again");
+        
+        if(finger.getImage() == FINGERPRINT_OK) {
+            finger.image2Tz(2);
+            break;
+        }
+        retry++;
         delay(1000);
     }
 
-    // Capture the second fingerprint
-    if (finger.image2Tz(2) != FINGERPRINT_OK) {
-        Serial.println("Failed to create template for the second image.");
+    if(retry >= 3) {
         lcd.clear();
-        lcd.setCursor(0, 0);
-        lcd.print("Error creating");
+        lcd.print("Enrollment");
         lcd.setCursor(0, 1);
-        lcd.print("second template.");
-        delay(2000);
+        lcd.print("Failed! Retry");
         return;
     }
 
-    // Create the fingerprint model
-    if (finger.createModel() != FINGERPRINT_OK) {
-        Serial.println("Failed to create fingerprint model.");
-        lcd.clear();
-        lcd.setCursor(0, 0);
-        lcd.print("Model creation");
-        lcd.setCursor(0, 1);
-        lcd.print("failed.");
-        delay(2000);
-        return;
-    }
-
-    // Store the fingerprint model
-    if (finger.storeModel(teacherId) != FINGERPRINT_OK) {
-        Serial.println("Failed to store fingerprint model.");
-        lcd.clear();
-        lcd.setCursor(0, 0);
-        lcd.print("Failed to store");
-        lcd.setCursor(0, 1);
-        lcd.print("fingerprint.");
-        delay(2000);
-        return;
-    }
-
-    // Successful enrollment message
+    // Final Processing
     lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("Fingerprint");
+    lcd.print("Processing...");
+    finger.createModel();
+    finger.storeModel(teacherId);
+    
+    lcd.clear();
+    lcd.print("Enrollment");
     lcd.setCursor(0, 1);
-    lcd.print("Enrollment Success");
+    lcd.print("Successful!");
     delay(2000);
-    Serial.println("Fingerprint enrollment successful.");
 
-    // Save teacher data to local storage and SD card
     saveTeacherData(teacherId, teacherName, courseName, coursecode);
 }
 
@@ -1519,7 +1439,7 @@ void saveTeacherData(int teacherId, const String& teacherName, const String& cou
 
     // Send to Supabase if connected to WiFi
     if (WiFi.status() == WL_CONNECTED) {
-        if (sendToSupabase("teachers", jsonString)) {
+        if (sendToSupabase("teachers", jsonString, "POST", -1)) {
             Serial.println("Teacher data sent to Supabase successfully.");
         } else {
             Serial.println("Error: Failed to send teacher data to Supabase.");
@@ -1566,7 +1486,10 @@ void handleEnrollStudent() {
     server.send(403, "text/html", "<h2>Authentication Failed. Access Denied!</h2>");
     return;
   }
-
+  if (WiFi.status() != WL_CONNECTED) {
+        server.send(400, "text/html", "<h2>Error: Cannot enroll student while offline.</h2>");
+        return;
+    }
   String htmlPage = R"rawliteral(
     <!DOCTYPE html>
     <html lang="en">
@@ -1634,117 +1557,98 @@ void handleEnrollStudent() {
 
 
 void enrollStudent(int studentId, const String& studentName, const String& stdroll) {
-    if (!initializeFingerprint()) {
-        lcd.clear();
-        lcd.setCursor(0, 0);
-        lcd.print("Sensor Error!");
-        lcd.setCursor(0, 1);
-        lcd.print("Try Again Later");
-        delay(3000);
-        return;
-    }
-
-    Serial.print("Starting enrollment for Student ID: ");
-    Serial.println(studentId);
     lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("StR ENR st id");
+    lcd.print("Enroll Student");
     lcd.setCursor(0, 1);
-    lcd.print(stdroll);
+    lcd.print("Roll: " + stdroll);
     delay(2000);
 
-    // Initialize fingerprint sensor
-    mySerial.begin(57600);
-    delay(1000);
-    finger.begin(57600);
+    // Step 1: Initial Scan
+    lcd.clear();
+    lcd.print("First Scan");
+    lcd.setCursor(0, 1);
+    lcd.print("Place finger");
+    
+    unsigned long start = millis();
+    while(finger.getImage() != FINGERPRINT_OK) {
+        if(millis() - start > 10000) {
+            lcd.clear();
+            lcd.print("Timeout!");
+            lcd.setCursor(0, 1);
+            lcd.print("Restarting...");
+            delay(2000);
+            return;
+        }
+    }
+    
+    finger.image2Tz(1);
+    lcd.clear();
+    lcd.print("Scan 1 OK");
+    lcd.setCursor(0, 1);
+    lcd.print("Remove finger");
+    delay(2000);
 
-    // Capture first fingerprint image
-    int status;
-    while ((status = finger.getImage()) != FINGERPRINT_OK) {
+    // Clearance Check
+    while(finger.getImage() == FINGERPRINT_OK) {
         lcd.clear();
-        lcd.setCursor(0, 0);
-        lcd.print("place :");
+        lcd.print("Finger still");
         lcd.setCursor(0, 1);
-        lcd.print("finger");
-        Serial.println("Place your finger on the sensor.");
+        lcd.print("detected!");
+        delay(500);
+    }
+
+    // Step 2: Verification Scan
+    lcd.clear();
+    lcd.print("Second Scan");
+    lcd.setCursor(0, 1);
+    lcd.print("Same finger");
+    
+    bool success = false;
+    for(int attempt=1; attempt<=3; attempt++) {
+        lcd.clear();
+        lcd.print("Attempt " + String(attempt));
+        lcd.setCursor(0, 1);
+        lcd.print("Place finger");
+        
+        if(finger.getImage() == FINGERPRINT_OK) {
+            finger.image2Tz(2);
+            success = true;
+            break;
+        }
         delay(1000);
     }
 
-    Serial.println("Fingerprint image taken.");
-    if (finger.image2Tz(1) != FINGERPRINT_OK) {
-        Serial.println("Failed to create template.");
+    if(!success) {
+        lcd.clear();
+        lcd.print("Too many");
+        lcd.setCursor(0, 1);
+        lcd.print("failed attempts");
+        delay(2000);
         return;
     }
 
-    // Capture second fingerprint image for validation
+    // Finalization
     lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("place same:");
+    lcd.print("Creating");
     lcd.setCursor(0, 1);
-    lcd.print("finger again");
-    delay(2000);
-    Serial.println("Place the same finger again.");
-    while ((status = finger.getImage()) != FINGERPRINT_OK) {
-        Serial.println("Waiting for second fingerprint image.");
-        delay(1000);
-    }
-
-    if (finger.image2Tz(2) != FINGERPRINT_OK) {
-        Serial.println("Failed to create second template.");
+    lcd.print("fingerprint...");
+    
+    if(finger.createModel() != FINGERPRINT_OK) {
+        lcd.clear();
+        lcd.print("Error: Models");
+        lcd.setCursor(0, 1);
+        lcd.print("don't match!");
         return;
     }
 
-    // Create and store fingerprint model
-    if (finger.createModel() != FINGERPRINT_OK) {
-        Serial.println("Failed to create fingerprint model.");
-        return;
-    }
-
-    if (finger.storeModel(studentId) != FINGERPRINT_OK) {
-        Serial.println("Failed to store fingerprint model.");
-        return;
-    }
-
-    // Final success message
+    finger.storeModel(studentId);
     lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("Fingerprint Enroll");
+    lcd.print("Student Added!");
     lcd.setCursor(0, 1);
-    lcd.print("success");
+    lcd.print("Roll: " + stdroll);
     delay(2000);
-    Serial.println("Fingerprint enrollment successful.");
 
-    // Save student data locally and to SD card
-    File file = SPIFFS.open("/students.csv", FILE_APPEND);
-    if (!file) {
-        Serial.println("Failed to open student data file for appending.");
-        return;
-    }
-    String dataLine = String(studentId) + "," + studentName + "," + stdroll + "\n";
-    file.print(dataLine);
-    file.close();
-
-    File sdFile = SD.open("/students.csv", FILE_APPEND);
-    if (sdFile) {
-        sdFile.print(dataLine);
-        sdFile.close();
-    } else {
-        Serial.println("Failed to open student data file on SD card!");
-    }
-
-    // Prepare JSON for Supabase
-    StaticJsonDocument<200> doc;
-    doc["student_id"] = studentId;
-    doc["name"] = studentName;
-    doc["roll_number"] = stdroll;
-
-    String jsonString;
-    serializeJson(doc, jsonString);
-
-    // Send to Supabase
-    if (WiFi.status() == WL_CONNECTED) {
-        sendToSupabase("students", jsonString);
-    }
+    saveStudentData(studentId, studentName, stdroll);
 }
 
 //23
@@ -1781,7 +1685,7 @@ void saveStudentData(int studentId, const String& studentName, const String& std
 
     // Send to Supabase if connected to WiFi
     if (WiFi.status() == WL_CONNECTED) {
-        sendToSupabase("students", jsonString);
+       sendToSupabase("students", jsonString, "POST", -1);
     }
 }
 
@@ -2247,9 +2151,9 @@ String fetchStudentName(int studentId) {
 
 //33
 void saveAttendance(String coursecode, String studentName, int studentId) {
-    DateTime now = rtc.now(); // Get current time from RTC
+    DateTime now = rtc.now();
     char timestamp[32];
-    sprintf(timestamp, "%04d-%02d-%02d", now.year(), now.month(), now.day()); // Format the date
+    sprintf(timestamp, "%04d-%02d-%02d", now.year(), now.month(), now.day());
 
     // Save to SD Card
     File sdAttendanceFile = SD.open("/attendance.csv", FILE_APPEND);
@@ -2274,6 +2178,11 @@ void saveAttendance(String coursecode, String studentName, int studentId) {
     attendanceFile.close();
     Serial.println("Attendance saved: " + record);
 
+    // --- MODIFICATION: Only save offline if not connected ---
+    if (WiFi.status() != WL_CONNECTED) {
+        saveOfflineAttendance(coursecode, studentName, studentId);
+    }
+
     // Prepare JSON for Supabase
     StaticJsonDocument<300> doc;
     doc["course_code"] = coursecode;
@@ -2286,433 +2195,23 @@ void saveAttendance(String coursecode, String studentName, int studentId) {
 
     // Send to Supabase
     if (WiFi.status() == WL_CONNECTED) {
-        sendToSupabase("attendance", jsonString);
+        sendToSupabase("attendance", jsonString, "POST", -1);
     }
 }
-
 
 //34
 
-void handleDownloadAttendance() {
-    if (!authenticateUser()) {
-        return;
-    }
-
-    // Start HTML page
-    String htmlPage = R"rawliteral(
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Download Attendance</title>
-            <style>
-                .container {
-                    max-width: 800px;
-                    margin: 0 auto;
-                    padding: 20px;
-                    font-family: Arial, sans-serif;
-                }
-                h2 {
-                    color: #333;
-                }
-                .option-button {
-                    display: inline-block;
-                    padding: 10px 20px;
-                    margin: 10px;
-                    background-color: #4CAF50;
-                    color: white;
-                    text-decoration: none;
-                    border-radius: 5px;
-                    cursor: pointer;
-                }
-                select {
-                    padding: 8px;
-                    margin: 10px 0;
-                    width: 250px;
-                    font-size: 14px;
-                }
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <h2>Select Course Code to Download Attendance</h2>
-                <select id="courseCode">
-    )rawliteral";
-
-    // Read course codes and names from teachers.csv
-    File teacherFile = SPIFFS.open("/teachers.csv", "r");
-    if (teacherFile) {
-        std::map<String, String> courseMap;  // courseCode -> courseName
-        
-        while (teacherFile.available()) {
-            String line = teacherFile.readStringUntil('\n');
-            int firstComma = line.indexOf(',');
-            int secondComma = line.indexOf(',', firstComma + 1);
-            int thirdComma = line.indexOf(',', secondComma + 1);
-            
-            if (firstComma != -1 && secondComma != -1 && thirdComma != -1) {
-                String courseName = line.substring(secondComma + 1, thirdComma);
-                String courseCode = line.substring(thirdComma + 1);
-                courseCode.trim();
-                if (courseCode.length() > 0) {
-                    courseMap[courseCode] = courseName;
-                }
-            }
-        }
-        teacherFile.close();
-
-        // Add options for each unique course code
-        for (const auto& course : courseMap) {
-            htmlPage += "    <option value=\"" + course.first + "\">" + 
-                       course.second + " (" + course.first + ")</option>\n";
-        }
-    }
-
-    htmlPage += R"rawliteral(
-                </select>
-                <br><br>
-                <a href="#" onclick="viewTotalAttendance()" class="option-button">View Total Attendance</a>
-                <a href="#" onclick="viewDatewiseAttendance()" class="option-button">View Date-wise Attendance</a>
-
-                <div id="attendanceData"></div>
-
-                <script>
-                    function viewTotalAttendance() {
-                        var courseCode = document.getElementById('courseCode').value;
-                        window.location.href = '/attendanceDetails?courseCode=' + courseCode + '&viewType=total';
-                    }
-
-                    function viewDatewiseAttendance() {
-                        var courseCode = document.getElementById('courseCode').value;
-                        window.location.href = '/attendanceDetails?courseCode=' + courseCode + '&viewType=datewise';
-                    }
-                </script>
-            </div>
-        </body>
-        </html>
-    )rawliteral";
-
-    // Send the generated HTML page
-    server.send(200, "text/html", htmlPage);
-}
 
 //36
 
-void handleViewAttendance() {
-    if (!authenticateUser()) {
-        return;
-    }
-
-    // Start HTML page
-    String htmlPage = R"rawliteral(
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Attendance View</title>
-            <style>
-                body {
-                    font-family: Arial, sans-serif;
-                    margin: 20px;
-                    line-height: 1.6;
-                }
-                h2 {
-                    color: #333;
-                }
-                form {
-                    margin-top: 20px;
-                }
-                select, input[type="submit"] {
-                    margin-top: 10px;
-                    padding: 8px;
-                    font-size: 14px;
-                }
-                a {
-                    display: block;
-                    margin-top: 10px;
-                    color: #007BFF;
-                    text-decoration: none;
-                }
-                a:hover {
-                    text-decoration: underline;
-                }
-            </style>
-        </head>
-        <body>
-            <h2>Attendance View</h2>
-            <form action="/attendanceDetails" method="GET">
-                <label for="courseCode">Select Course Code:</label>
-                <select name="courseCode" id="courseCode">
-    )rawliteral";
-
-    // Fetch unique course codes from teachers.csv
-    std::set<String> courseCodes;
-    File teacherFile = SPIFFS.open("/teachers.csv", "r");
-    if (teacherFile) {
-        while (teacherFile.available()) {
-            String line = teacherFile.readStringUntil('\n');
-            int lastComma = line.lastIndexOf(',');
-            if (lastComma != -1) {
-                String courseCode = line.substring(lastComma + 1);
-                courseCodes.insert(courseCode);
-            }
-        }
-        teacherFile.close();
-    }
-
-    // Add course code options to the dropdown
-    for (const String& courseCode : courseCodes) {
-        htmlPage += "<option value=\"" + courseCode + "\">" + courseCode + "</option>";
-    }
-
-    // Add links for total and date-wise attendance options
-    htmlPage += R"rawliteral(
-                </select>
-                <input type="submit" value="View Attendance">
-            </form>
-            <h3>Quick Links:</h3>
-    )rawliteral";
-
-    for (const String& courseCode : courseCodes) {
-        htmlPage += "<a href=\"/attendanceDetails?courseCode=" + courseCode + "&viewType=total\">Total Attendance for " + courseCode + "</a>";
-        htmlPage += "<a href=\"/attendanceDetails?courseCode=" + courseCode + "&viewType=datewise\">Date-wise Attendance for " + courseCode + "</a>";
-    }
-
-    htmlPage += R"rawliteral(
-            <a href="/datewiseDownload">Download Date-wise Attendance</a>
-        </body>
-        </html>
-    )rawliteral";
-
-    // Send the generated HTML page
-    server.send(200, "text/html", htmlPage);
-}
 
 
 //37
-void handleAttendanceDetails1() {
-    if (!authenticateUser()) {
-        return;
-    }
 
-    String courseCode = server.arg("courseCode");
-    String viewType = server.arg("viewType");
-
-    String htmlPage = R"rawliteral(
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Attendance Details - )rawliteral" + courseCode + R"rawliteral(</title>
-            <style>
-                table {
-                    border-collapse: collapse;
-                    width: 100%;
-                }
-                th, td {
-                    border: 1px solid black;
-                    padding: 8px;
-                    text-align: left;
-                }
-            </style>
-        </head>
-        <body>
-            <h2>Attendance Details for )rawliteral" + courseCode + R"rawliteral(</h2>
-    )rawliteral";
-
-    if (viewType == "total") {
-        // Fetch attendance data and calculate total classes
-        std::map<String, int> attendanceData;
-        int totalClasses = 0;
-        if (File attendanceFile = SPIFFS.open("/attendance.csv", "r")) {
-            while (attendanceFile.available()) {
-                String line = attendanceFile.readStringUntil('\n');
-                int firstComma = line.indexOf(',');
-                int secondComma = line.indexOf(',', firstComma + 1);
-                int thirdComma = line.indexOf(',', secondComma + 1);
-                if (firstComma != -1 && secondComma != -1 && thirdComma != -1) {
-                    String fileCourseCode = line.substring(0, firstComma);
-                    String studentRoll = line.substring(secondComma + 1, thirdComma);
-                    if (fileCourseCode == courseCode) {
-                        attendanceData[studentRoll]++;
-                        totalClasses++;
-                    }
-                }
-            }
-            attendanceFile.close();
-        }
-
-        // Generate table for total attendance
-        htmlPage += R"rawliteral(
-            <table>
-                <tr>
-                    <th>Roll</th>
-                    <th>Name</th>
-                    <th>Attendance</th>
-                    <th>Marks</th>
-                </tr>
-        )rawliteral";
-
-        if (File studentFile = SPIFFS.open("/students.csv", "r")) {
-            while (studentFile.available()) {
-                String line = studentFile.readStringUntil('\n');
-                int firstComma = line.indexOf(',');
-                int secondComma = line.indexOf(',', firstComma + 1);
-                if (firstComma != -1 && secondComma != -1) {
-                    String studentRoll = line.substring(0, firstComma);
-                    String studentName = line.substring(firstComma + 1, secondComma);
-                    int attendance = attendanceData.count(studentRoll) ? attendanceData[studentRoll] : 0;
-                    double attendancePercentage = (attendance * 100.0) / totalClasses;
-                    int marks = (attendancePercentage >= 95) ? 8 :
-                                (attendancePercentage >= 90) ? 7 :
-                                (attendancePercentage >= 85) ? 6 :
-                                (attendancePercentage >= 80) ? 5 :
-                                (attendancePercentage >= 75) ? 4 :
-                                (attendancePercentage >= 70) ? 3 :
-                                (attendancePercentage >= 65) ? 2 :
-                                (attendancePercentage >= 60) ? 1 : 0;
-
-                    htmlPage += "<tr><td>" + studentRoll + "</td><td>" + studentName + "</td><td>" +
-                                String(attendance) + "/" + String(totalClasses) + " (" + String(attendancePercentage, 2) + "%)</td><td>" +
-                                String(marks) + "</td></tr>";
-                }
-            }
-            studentFile.close();
-        }
-
-        htmlPage += R"rawliteral(
-            </table>
-        )rawliteral";
-
-    } else if (viewType == "datewise") {
-        // Fetch unique dates for datewise view
-        std::set<String> dates;
-        if (File attendanceFile = SPIFFS.open("/attendance.csv", "r")) {
-            while (attendanceFile.available()) {
-                String line = attendanceFile.readStringUntil('\n');
-                int firstComma = line.indexOf(',');
-                int lastComma = line.lastIndexOf(',');
-                if (firstComma != -1 && lastComma != -1) {
-                    String fileCourseCode = line.substring(0, firstComma);
-                    String fileDate = line.substring(lastComma + 1, lastComma + 11);
-                    if (fileCourseCode == courseCode) {
-                        dates.insert(fileDate);
-                    }
-                }
-            }
-            attendanceFile.close();
-        }
-
-        // Generate HTML form for selecting a date
-        htmlPage += R"rawliteral(
-            <form action="/datewiseAttendance" method="GET">
-                <input type="hidden" name="courseCode" value=")rawliteral" + courseCode + R"rawliteral(">
-                <label for="date">Select Date:</label>
-                <select name="date" id="date">
-        )rawliteral";
-
-        for (const String& date : dates) {
-            htmlPage += "<option value=\"" + date + "\">" + date + "</option>";
-        }
-
-        htmlPage += R"rawliteral(
-                </select>
-                <br><br>
-                <input type="submit" value="View Attendance">
-            </form>
-        )rawliteral";
-    }
-
-    htmlPage += R"rawliteral(
-        </body>
-        </html>
-    )rawliteral";
-
-    server.send(200, "text/html", htmlPage);
-}
 
 
 //38
-void handleDatewiseAttendance() {
-    if (!authenticateUser()) {
-        return;
-    }
 
-    String courseCode = server.arg("courseCode");
-    String date = server.arg("date");
-
-    String htmlPage = R"rawliteral(
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Date-wise Attendance - )rawliteral" + courseCode + R"rawliteral(</title>
-            <style>
-                table {
-                    border-collapse: collapse;
-                    width: 100%;
-                }
-                th, td {
-                    border: 1px solid black;
-                    padding: 8px;
-                    text-align: left;
-                }
-            </style>
-        </head>
-        <body>
-            <h2>Date-wise Attendance for )rawliteral" + courseCode + R"rawliteral( on )rawliteral" + date + R"rawliteral(</h2>
-            <table>
-                <tr>
-                    <th>Roll</th>
-                    <th>Name</th>
-                    <th>Attendance</th>
-                </tr>
-    )rawliteral";
-
-    // Fetch attendance data from attendance.csv for the given date and course code
-    std::set<String> attendedStudents;
-    File attendanceFile = SPIFFS.open("/attendance.csv", "r");
-    if (attendanceFile) {
-        while (attendanceFile.available()) {
-            String line = attendanceFile.readStringUntil('\n');
-            int firstComma = line.indexOf(',');
-            int secondComma = line.indexOf(',', firstComma + 1);
-            int thirdComma = line.indexOf(',', secondComma + 1);
-            int lastComma = line.lastIndexOf(',');
-            if (firstComma != -1 && secondComma != -1 && thirdComma != -1 && lastComma != -1) {
-                String fileCourseCode = line.substring(0, firstComma);
-                String studentRoll = line.substring(secondComma + 1, thirdComma);
-                String dateTime = line.substring(lastComma + 1);
-                String fileDate = dateTime.substring(0, 10);
-                if (fileCourseCode == courseCode && fileDate == date) {
-                    attendedStudents.insert(studentRoll);
-                }
-            }
-        }
-        attendanceFile.close();
-    }
-
-    // Generate HTML table for date-wise attendance
-    File studentFile = SPIFFS.open("/students.csv", "r");
-    if (studentFile) {
-        while (studentFile.available()) {
-            String line = studentFile.readStringUntil('\n');
-            int firstComma = line.indexOf(',');
-            int secondComma = line.indexOf(',', firstComma + 1);
-            if (firstComma != -1 && secondComma != -1) {
-                String studentRoll = line.substring(0, firstComma);
-                String studentName = line.substring(firstComma + 1, secondComma);
-                String attendance = (attendedStudents.count(studentRoll) > 0) ? "Present" : "Absent";
-                htmlPage += "<tr><td>" + studentRoll + "</td><td>" + studentName + "</td><td>" + attendance + "</td></tr>";
-            }
-        }
-        studentFile.close();
-    }
-
-    htmlPage += R"rawliteral(
-            </table>
-        </body>
-        </html>
-    )rawliteral";
-
-    server.send(200, "text/html", htmlPage);
-}
 
 
 
@@ -2978,314 +2477,16 @@ void cancelAttendanceProcess() {
 
 //45
 
-void handleAttendanceDetails() {
-    if (!authenticateUser()) {
-        return;
-    }
 
-    String courseCode = server.arg("courseCode");
-    String type = server.arg("type");
-
-    String htmlPage = R"rawliteral(
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Attendance Details</title>
-            <style>
-                .container {
-                    max-width: 900px;
-                    margin: 0 auto;
-                    padding: 20px;
-                }
-                table {
-                    width: 100%;
-                    border-collapse: collapse;
-                    margin: 20px 0;
-                }
-                th, td {
-                    border: 1px solid #ddd;
-                    padding: 8px;
-                    text-align: left;
-                }
-                th {
-                    background-color: #4CAF50;
-                    color: white;
-                }
-                .download-link {
-                    display: inline-block;
-                    padding: 5px 10px;
-                    background-color: #4CAF50;
-                    color: white;
-                    text-decoration: none;
-                    border-radius: 3px;
-                    margin: 5px;
-                }
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <h2>Attendance Details for Course: )rawliteral" + courseCode + R"rawliteral(</h2>
-    )rawliteral";
-    
-    // Get course name for the header
-    String courseName = "";
-    File teacherFile = SPIFFS.open("/teachers.csv", "r");
-    if (teacherFile) {
-        while (teacherFile.available()) {
-            String line = teacherFile.readStringUntil('\n');
-            int firstComma = line.indexOf(',');
-            int secondComma = line.indexOf(',', firstComma + 1);
-            int thirdComma = line.indexOf(',', secondComma + 1);
-            String fileCourseName = line.substring(secondComma + 1, thirdComma);
-            String fileCourseCode = line.substring(thirdComma + 1);
-            if (fileCourseCode.equals(courseCode)) {
-                courseName = fileCourseName;
-                break;
-            }
-        }
-        teacherFile.close();
-    }
-
-    htmlPage += "<h2>Attendance Details for " + courseName + " (" + courseCode + ")</h2>";
-    
-    if (type == "total") {
-        // Calculate total attendance
-        std::map<String, int> studentAttendance;
-        int totalClasses = 0;
-        std::set<String> uniqueDates;
-
-        // Read attendance.csv to get total classes and attendance counts
-        File attendanceFile = SPIFFS.open("/attendance.csv", "r");
-        if (attendanceFile) {
-            while (attendanceFile.available()) {
-                String line = attendanceFile.readStringUntil('\n');
-                if (line.startsWith(courseCode + ",")) {
-                    int firstComma = line.indexOf(',');
-                    int secondComma = line.indexOf(',', firstComma + 1);
-                    int thirdComma = line.indexOf(',', secondComma + 1);
-                    
-                    String studentId = line.substring(secondComma + 1, thirdComma);
-                    String date = line.substring(thirdComma + 1, thirdComma + 11); // Extract date part
-                    
-                    uniqueDates.insert(date);
-                    studentAttendance[studentId]++;
-                }
-            }
-            attendanceFile.close();
-        }
-
-        totalClasses = uniqueDates.size(); // Number of unique dates is total classes
-
-        // Create attendance table
-        htmlPage += R"rawliteral(
-            <table>
-                <tr>
-                    <th>Roll Number</th>
-                    <th>Name</th>
-                    <th>Attendance</th>
-                    <th>Percentage</th>
-                    <th>Marks</th>
-                </tr>
-        )rawliteral";
-
-        // Read students.csv and display attendance data
-        File studentFile = SPIFFS.open("/students.csv", "r");
-        if (studentFile) {
-            while (studentFile.available()) {
-                String line = studentFile.readStringUntil('\n');
-                int firstComma = line.indexOf(',');
-                int secondComma = line.indexOf(',', firstComma + 1);
-                
-                if (firstComma != -1 && secondComma != -1) {
-                    String studentId = line.substring(0, firstComma);
-                    String studentName = line.substring(firstComma + 1, secondComma);
-                    String rollNumber = line.substring(secondComma + 1);
-                    
-                    int attended = studentAttendance[studentId];
-                    float percentage = totalClasses > 0 ? (attended * 100.0 / totalClasses) : 0;
-                    int marks = calculateMarks(percentage);
-
-                    htmlPage += "<tr><td>" + rollNumber + "</td><td>" + studentName + 
-                               "</td><td>" + String(attended) + "/" + String(totalClasses) + 
-                               "</td><td>" + String(percentage, 1) + "%" +
-                               "</td><td>" + String(marks) + "</td></tr>";
-                }
-            }
-            studentFile.close();
-        }
-        
-        htmlPage += "</table>";
-        
-    } else if (type == "datewise") {
-        // Show date-wise attendance with download links
-        std::set<String> dates;
-        
-        // Get unique dates for this course
-        File attendanceFile = SPIFFS.open("/attendance.csv", "r");
-        if (attendanceFile) {
-            while (attendanceFile.available()) {
-                String line = attendanceFile.readStringUntil('\n');
-                if (line.startsWith(courseCode + ",")) {
-                    int lastComma = line.lastIndexOf(',');
-                    String date = line.substring(lastComma + 1, lastComma + 11); // Extract date part
-                    dates.insert(date);
-                }
-            }
-            attendanceFile.close();
-        }
-
-        htmlPage += R"rawliteral(
-            <table>
-                <tr>
-                    <th>Date</th>
-                    <th>Action</th>
-                </tr>
-        )rawliteral";
-
-        for (const String& date : dates) {
-            htmlPage += "<tr><td>" + date + "</td><td>" +
-                       "<a href='/downloadDateAttendance?courseCode=" + courseCode + "&date=" + date + 
-                       "' class='download-link'>Download</a></td></tr>";
-        }
-        
-        htmlPage += "</table>";
-    }
-
-    htmlPage += R"rawliteral(
-            </div>
-        </body>
-        </html>
-    )rawliteral";
-
-    server.send(200, "text/html", htmlPage);
-}
 
 //46
-String generateTotalAttendance(const String& courseCode) {
-    std::map<String, int> attendanceData;
-    int totalClasses = 0;
 
-    // Parse attendance.csv
-    File attendanceFile = SPIFFS.open("/attendance.csv", "r");
-    if (!attendanceFile) {
-        Serial.println("Failed to open attendance file.");
-        return "<p>Error loading attendance data.</p>";
-    }
-
-    // Collect attendance data for the course
-    while (attendanceFile.available()) {
-        String line = attendanceFile.readStringUntil('\n');
-        auto parsed = parseCSVLine(line, {0, 1}); // Parse course code and roll number
-        if (parsed.size() > 1 && parsed[0] == courseCode) {
-            attendanceData[parsed[1]]++;
-            totalClasses++;
-        }
-    }
-    attendanceFile.close();
-
-    // If no classes are found, return a message
-    if (totalClasses == 0) {
-        return "<p>No attendance records found for this course.</p>";
-    }
-
-    // Generate HTML table
-    String table = R"rawliteral(
-        <table border="1">
-            <tr>
-                <th>Roll</th>
-                <th>Name</th>
-                <th>Attendance</th>
-                <th>Marks</th>
-            </tr>
-    )rawliteral";
-
-    File studentFile = SPIFFS.open("/students.csv", "r");
-    if (!studentFile) {
-        Serial.println("Failed to open student file.");
-        return "<p>Error loading student data.</p>";
-    }
-
-    // Create table rows for each student
-    while (studentFile.available()) {
-        String line = studentFile.readStringUntil('\n');
-        auto parsed = parseCSVLine(line, {0, 1}); // Parse roll and name
-        if (parsed.size() > 1) {
-            String roll = parsed[0];
-            String name = parsed[1];
-            int attendance = attendanceData[roll];
-            double percentage = (attendance * 100.0) / totalClasses;
-            int marks = calculateMarks(percentage);
-
-            table += "<tr><td>" + roll + "</td><td>" + name + "</td><td>" +
-                     String(attendance) + "/" + String(totalClasses) + " (" +
-                     String(percentage, 2) + "%)</td><td>" + String(marks) + "</td></tr>";
-        }
-    }
-    studentFile.close();
-
-    table += "</table>";
-    return table;
-}
 
 //47
-String generateDatewiseAttendance(const String& courseCode) {
-    std::set<String> dates;
 
-    // Parse attendance.csv to fetch dates
-    File attendanceFile = SPIFFS.open("/attendance.csv", "r");
-    if (!attendanceFile) {
-        Serial.println("Failed to open attendance file.");
-        return "";
-    }
-
-    while (attendanceFile.available()) {
-        String line = attendanceFile.readStringUntil('\n');
-        auto parsed = parseCSVLine(line, {0, 3}); // Parse course code and date
-        if (parsed.size() > 1 && parsed[0] == courseCode) {
-            dates.insert(parsed[1].substring(0, 10)); // Extract date in yyyy-mm-dd format
-        }
-    }
-    attendanceFile.close();
-
-    // If no dates found for the given course, return a message
-    if (dates.empty()) {
-        return "<p>No attendance records found for the selected course.</p>";
-    }
-
-    // Generate HTML table
-    String table = R"rawliteral(
-        <form action="/datewiseAttendance" method="GET">
-            <label for="date">Select Date:</label>
-            <select name="date" id="date">
-    )rawliteral";
-
-    for (const auto& date : dates) {
-        table += "<option value=\"" + date + "\">" + date + "</option>";
-    }
-
-    table += R"rawliteral(
-            </select>
-            <br><br>
-            <input type="hidden" name="courseCode" value=")rawliteral" + courseCode + R"rawliteral(">
-            <input type="submit" value="View Attendance">
-        </form>
-    )rawliteral";
-
-    return table;
-}
 
 //48
-int calculateMarks(double percentage) {
-    if (percentage >= 95) return 8; // Excellent
-    if (percentage >= 90) return 7; // Very Good
-    if (percentage >= 85) return 6; // Good
-    if (percentage >= 80) return 5; // Satisfactory
-    if (percentage >= 75) return 4; // Fair
-    if (percentage >= 70) return 3; // Average
-    if (percentage >= 65) return 2; // Below Average
-    if (percentage >= 60) return 1; // Needs Improvement
-    return 0; // Fail
-}
+
 
 
 
@@ -3295,81 +2496,7 @@ int calculateMarks(double percentage) {
 
 
 //49
-void handleDateWiseDownload() {
-    if (!authenticateUser()) {
-        server.send(401, "text/plain", "Unauthorized access");
-        return;
-    }
 
-    String htmlPage = R"rawliteral(
-        <h2>Date-wise Attendance Download</h2>
-        <table border="1">
-            <tr>
-                <th>Course Name (Code)</th>
-                <th>Date</th>
-                <th>Download Link</th>
-            </tr>
-    )rawliteral";
-
-    // Get course names and codes
-    std::map<String, String> courseNames;
-    File teacherFile = SPIFFS.open("/teachers.csv", "r");
-    if (!teacherFile) {
-        server.send(500, "text/plain", "Failed to open teachers file.");
-        return;
-    }
-
-    while (teacherFile.available()) {
-        String line = teacherFile.readStringUntil('\n');
-        int firstComma = line.indexOf(',');
-        int secondComma = line.indexOf(',', firstComma + 1);
-        int thirdComma = line.indexOf(',', secondComma + 1);
-
-        if (firstComma != -1 && secondComma != -1 && thirdComma != -1) {
-            String courseName = line.substring(secondComma + 1, thirdComma);
-            String courseCode = line.substring(thirdComma + 1);
-            courseCode.trim();
-            courseNames[courseCode] = courseName;
-        }
-    }
-    teacherFile.close();
-
-    // Get attendance records by date for each course
-    std::map<String, std::set<String>> datesByCourse;
-    File attendanceFile = SPIFFS.open("/attendance.csv", "r");
-    if (!attendanceFile) {
-        server.send(500, "text/plain", "Failed to open attendance file.");
-        return;
-    }
-
-    while (attendanceFile.available()) {
-        String line = attendanceFile.readStringUntil('\n');
-        int firstComma = line.indexOf(',');
-        int lastComma = line.lastIndexOf(',');
-
-        if (firstComma != -1 && lastComma != -1) {
-            String courseCode = line.substring(0, firstComma);
-            String date = line.substring(lastComma + 1, lastComma + 11); // Extract date in yyyy-mm-dd format
-            datesByCourse[courseCode].insert(date);
-        }
-    }
-    attendanceFile.close();
-
-    // Generate HTML table rows for each course and date
-    for (const auto& course : datesByCourse) {
-        String courseCode = course.first;
-        String courseName = courseNames[courseCode];
-
-        for (const String& date : course.second) {
-            htmlPage += "<tr><td>" + courseName + " (" + courseCode + ")</td><td>" + 
-                       date + "</td><td><a href=\"/downloadAttendance?courseCode=" + 
-                       courseCode + "&date=" + date + "\">Download</a></td></tr>";
-        }
-    }
-
-    htmlPage += "</table>";
-    server.send(200, "text/html", htmlPage);
-}
 
 
 //50
@@ -3437,232 +2564,300 @@ void handleDownloadAttendanceByDate() {
 
 //52
 
-void handleDownloadDateAttendance() {
-    if (!authenticateUser()) {
-        server.send(401, "text/plain", "Unauthorized access");
-        return;
-    }
 
-    String courseCode = server.arg("courseCode");
-    String date = server.arg("date");
-
-    if (courseCode.isEmpty() || date.isEmpty()) {
-        server.send(400, "text/plain", "Invalid request. Missing courseCode or date parameter.");
-        return;
-    }
-
-    String courseName = "";
-    // Get course name from teachers.csv
-    File teacherFile = SPIFFS.open("/teachers.csv", "r");
-    if (!teacherFile) {
-        server.send(500, "text/plain", "Failed to open teachers file.");
-        return;
-    }
-
-    while (teacherFile.available()) {
-        String line = teacherFile.readStringUntil('\n');
-        if (line.indexOf(courseCode) != -1) {
-            int firstComma = line.indexOf(',');
-            int secondComma = line.indexOf(',', firstComma + 1);
-            int thirdComma = line.indexOf(',', secondComma + 1);
-            courseName = line.substring(secondComma + 1, thirdComma);
-            break;
-        }
-    }
-    teacherFile.close();
-
-    if (courseName.isEmpty()) {
-        server.send(404, "text/plain", "Course not found.");
-        return;
-    }
-
-    // Create temporary file for filtered attendance
-    File tempFile = SPIFFS.open("/temp_download.csv", "w");
-    if (!tempFile) {
-        server.send(500, "text/plain", "Error creating temporary file.");
-        return;
-    }
-
-    tempFile.println("Course Name,Course Code,Student Name,Roll Number,Time");
-
-    // Read and filter attendance records
-    File attendanceFile = SPIFFS.open("/attendance.csv", "r");
-    if (!attendanceFile) {
-        tempFile.close();
-        SPIFFS.remove("/temp_download.csv");
-        server.send(500, "text/plain", "Failed to open attendance file.");
-        return;
-    }
-
-    while (attendanceFile.available()) {
-        String line = attendanceFile.readStringUntil('\n');
-        if (line.startsWith(courseCode + ",") && line.indexOf(date) != -1) {
-            tempFile.print(courseName + ",");
-            tempFile.println(line);
-        }
-    }
-    attendanceFile.close();
-    tempFile.close();
-
-    // Serve the filtered file
-    File downloadFile = SPIFFS.open("/temp_download.csv", "r");
-    if (!downloadFile) {
-        server.send(500, "text/plain", "Error reading filtered attendance file.");
-        SPIFFS.remove("/temp_download.csv");
-        return;
-    }
-
-    server.sendHeader("Content-Disposition", "attachment; filename=attendance_" + courseCode + "_" + date + ".csv");
-    server.streamFile(downloadFile, "text/csv");
-    downloadFile.close();
-
-    // Clean up
-    SPIFFS.remove("/temp_download.csv");
-}
 
 //53
 void saveOfflineAttendance(String courseCode, String studentName, int studentId) {
-    // Helper function to format the current date as "yyyy-mm-dd"
-    auto getCurrentDate = []() {
-        DateTime now = rtc.now(); // Get current time from RTC
-        char timestamp[11];
-        sprintf(timestamp, "%04d-%02d-%02d", now.year(), now.month(), now.day()); // Format as yyyy-mm-dd
-        return String(timestamp);
-    };
+    DateTime now = rtc.now();
+    char dateStr[11];
+    sprintf(dateStr, "%04d-%02d-%02d", now.year(), now.month(), now.day());
 
-    String timestamp = getCurrentDate();
+    String record = 
+        courseCode + "," + 
+        studentName + "," + 
+        String(studentId) + "," + 
+        dateStr + "\n";
 
-    // Record format: CourseCode,StudentName,StudentId,Date
-    String record = courseCode + "," + studentName + "," + String(studentId) + "," + timestamp + "\n";
-
-    // Helper function to save data to a file
-    auto saveToFile = [](String fileName, const String& record, bool isSDCard = false) {
-        File file = isSDCard ? SD.open(fileName, FILE_APPEND) : SPIFFS.open(fileName, FILE_APPEND);
-        if (!file) {
-            Serial.printf("Failed to open %s for writing!\n", fileName.c_str());
-            return false;
-        }
+    // Save to offline file
+    File file = SPIFFS.open("/offline_attendance.csv", FILE_APPEND);
+    if (file) {
         file.print(record);
         file.close();
-        Serial.printf("Saved to %s: %s\n", fileName.c_str(), record.c_str());
-        return true;
-    };
-
-    // Save to SD card
-    if (!saveToFile("/attendance.csv", record, true)) {
-        Serial.println("SD card save failed.");
+        Serial.println("Saved to offline file: " + record);
+        offlineDataSent = false; // Reset flag for new data
+    } else {
+        Serial.println("Failed to save offline attendance!");
     }
 
-    // Save to SPIFFS
-    if (!saveToFile("/attendance.csv", record)) {
-        Serial.println("SPIFFS save failed.");
-    }
-
-    // Save to offline attendance file
-    if (!saveToFile("/offline_attendance.csv", record)) {
-        Serial.println("Offline attendance save failed.");
+    // Optional: Save to SD card as backup
+    File sdFile = SD.open("/offline_attendance.csv", FILE_APPEND);
+    if (sdFile) {
+        sdFile.print(record);
+        sdFile.close();
     }
 }
 
 //54
 void sendOfflineDataToSupabase() {
-    static unsigned long lastSyncTime = 0;
-    const unsigned long syncInterval = 60000; // Sync every 60 seconds
-    const int maxRetries = 3; // Max retry attempts for each record
-
+    // Check if the device is connected to Wi-Fi
     if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("Not connected to Wi-Fi. Skipping offline data sync.");
-        return;
+        Serial.println("Wi-Fi not connected. Skipping sync.");
+        return; // Exit if not connected
     }
 
-    // Only attempt to sync at regular intervals
-    if (millis() - lastSyncTime < syncInterval) {
-        return;
-    }
+    // Only attempt to send if data has not been sent successfully before
+    if (offlineDataSent) return; // If data has been sent, exit immediately
+
+    Serial.println("Attempting to send offline data to Supabase...");
+    static unsigned long lastSyncTime = 0;
+    const unsigned long syncInterval = 6000; // Sync every 60 seconds
+    const int maxRetries = 3;
+
+    // Check if enough time has passed since the last sync attempt
+    if (millis() - lastSyncTime < syncInterval) return;
     lastSyncTime = millis();
 
     File offlineFile = SPIFFS.open("/offline_attendance.csv", "r");
     if (!offlineFile) {
         Serial.println("No offline data to sync.");
+        offlineDataSent = true; // Mark as sent if no data exists
         return;
     }
 
-    bool allSentSuccessfully = true; // Track if all records were sent successfully
-    String unsyncedData = "";        // Buffer to store records that failed to sync
+    bool allSentSuccessfully = true;
+    String unsyncedData;
 
     while (offlineFile.available()) {
         String line = offlineFile.readStringUntil('\n');
-        if (line.length() > 0) {
-            // Parse the line
-            int firstComma = line.indexOf(',');
-            int secondComma = line.indexOf(',', firstComma + 1);
-            int thirdComma = line.indexOf(',', secondComma + 1);
+        line.trim();
+        if (line.isEmpty()) continue;
 
-            String courseCode = line.substring(0, firstComma);
-            String studentName = line.substring(firstComma + 1, secondComma);
-            String studentId = line.substring(secondComma + 1, thirdComma);
-            String timestamp = line.substring(thirdComma + 1);
+        // Parse line into components
+        int firstComma = line.indexOf(',');
+        int secondComma = line.indexOf(',', firstComma + 1);
+        int thirdComma = line.indexOf(',', secondComma + 1);
 
-            // Prepare JSON for Supabase
-            StaticJsonDocument<300> doc;
-            doc["course_code"] = courseCode;
-            doc["student_name"] = studentName;
-            doc["student_id"] = studentId.toInt();
-            doc["timestamp"] = timestamp;
+        if (firstComma == -1 || secondComma == -1 || thirdComma == -1) {
+            Serial.println("Skipping malformed line: " + line);
+            continue;
+        }
 
-            String jsonString;
-            serializeJson(doc, jsonString);
+        String courseCode = line.substring(0, firstComma);
+        String studentName = line.substring(firstComma + 1, secondComma);
+        String studentId = line.substring(secondComma + 1, thirdComma);
+        String timestamp = line.substring(thirdComma + 1);
 
-            // Send to Supabase with retry logic
-            bool sentSuccessfully = false;
-            for (int attempt = 1; attempt <= maxRetries; attempt++) {
-                HTTPClient http;
-                String url = String(SUPABASE_URL) + "/rest/v1/attendance";
-                http.begin(url);
-                http.addHeader("apikey", SUPABASE_KEY);
-                http.addHeader("Authorization", "Bearer " + String(SUPABASE_KEY));
-                http.addHeader("Content-Type", "application/json");
+        // Build JSON payload
+        StaticJsonDocument<300> doc;
+        doc["course_code"] = courseCode;
+        doc["student_name"] = studentName;
+        doc["student_id"] = studentId.toInt();
+        doc["timestamp"] = timestamp;
 
-                int httpCode = http.POST(jsonString);
+        String jsonString;
+        serializeJson(doc, jsonString);
 
-                if (httpCode == 200 || httpCode == 201) {
-                    Serial.println("Record sent to Supabase successfully: " + jsonString);
-                    sentSuccessfully = true;
-                    break; // Exit retry loop if successful
-                } else {
-                    Serial.printf("Attempt %d: Failed to send record to Supabase (HTTP %d): %s\n",
-                                  attempt, httpCode, http.errorToString(httpCode).c_str());
-                }
-                http.end();
-                delay(100); // Short delay between retries
+        // Send with retry logic
+        bool sent = false;
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            HTTPClient http;
+            http.begin(String(SUPABASE_URL) + "/rest/v1/attendance");
+            http.addHeader("apikey", SUPABASE_KEY);
+            http.addHeader("Authorization", "Bearer " + String(SUPABASE_KEY));
+            http.addHeader("Content-Type", "application/json");
+
+            int httpCode = http.POST(jsonString);
+            http.end();
+
+            if (httpCode == 200 || httpCode == 201) {
+                sent = true;
+                break; // Exit the retry loop on success
+            } else {
+                Serial.printf("Attempt %d failed. HTTP: %d\n", attempt, httpCode);
+                delay(1000 * attempt); // Exponential backoff
             }
+        }
 
-            if (!sentSuccessfully) {
-                allSentSuccessfully = false;
-                unsyncedData += line + "\n"; // Retain unsynced data
-            }
+        if (!sent) {
+            allSentSuccessfully = false;
+            unsyncedData += line + "\n"; // Retain unsent data
         }
     }
     offlineFile.close();
 
-    // Handle results
-    if (allSentSuccessfully) {
-        SPIFFS.remove("/offline_attendance.csv");
-        Serial.println("All offline attendance data sent successfully and file removed.");
-    } else {
-        // Rewrite unsynced data to the file
+    // Update offline file
+    if (!allSentSuccessfully) {
         File writeFile = SPIFFS.open("/offline_attendance.csv", "w");
         if (writeFile) {
             writeFile.print(unsyncedData);
             writeFile.close();
-            Serial.println("Unsynced data retained for the next attempt.");
+            Serial.println("Unsynced data retained in file.");
+            offlineDataSent = false; // Ensure future sync attempts
         } else {
-            Serial.println("Failed to rewrite unsynced data.");
+            Serial.println("Failed to update offline file.");
         }
+    } else {
+        SPIFFS.remove("/offline_attendance.csv");
+        Serial.println("All data synced. File removed.");
+        offlineDataSent = true; // Set flag to true after successful send
     }
 }
 
 
+
+void handleSDImportTeachers() {
+  if (!authenticateUser()) return;
+
+  if (!SD.exists("/teachers.csv")) {
+    server.send(404, "text/html", "<h2>Error: teachers.csv not found on SD card.</h2>");
+    return;
+  }
+
+  File sdFile = SD.open("/teachers.csv");
+  File spiffsFile = SPIFFS.open("/teachers.csv", "w");
+
+  if (!sdFile || !spiffsFile) {
+    server.send(500, "text/html", "<h2>Error: File access failed.</h2>");
+    return;
+  }
+
+  while (sdFile.available()) {
+    spiffsFile.write(sdFile.read());
+  }
+
+  sdFile.close();
+  spiffsFile.close();
+
+  server.sendHeader("Location", "/editTeacher?import=1");
+  server.send(303);
+}
+
+void handleSDImportStudents() {
+  if (!authenticateUser()) return;
+
+  if (!SD.exists("/students.csv")) {
+    server.send(404, "text/html", "<h2>Error: students.csv not found on SD!</h2>");
+    return;
+  }
+
+  File sdFile = SD.open("/students.csv", FILE_READ);
+  File spiffsFile = SPIFFS.open("/students.csv", FILE_WRITE);
+
+  if (!sdFile || !spiffsFile) {
+    server.send(500, "text/html", "<h2>File access error!</h2>");
+    if (sdFile) sdFile.close();
+    return;
+  }
+
+  spiffsFile.print(sdFile.readString());
+  
+  sdFile.close();
+  spiffsFile.close();
+
+  server.sendHeader("Location", "/editStudent?import=success");
+  server.send(303);
+}
+
+void handleSDViewTeachers() {
+  if (!authenticateUser()) return;
+
+  if (!SD.exists("/teachers.csv")) {
+    server.send(404, "text/html", "<h2>No teacher data on SD card!</h2>");
+    return;
+  }
+
+  File file = SD.open("/teachers.csv");
+  String html = R"(
+    <h2>SD Card Teacher Data</h2>
+    <table border='1'>
+      <tr><th>ID</th><th>Name</th><th>Course</th><th>Code</th></tr>
+  )";
+
+  while (file.available()) {
+    String line = file.readStringUntil('\n');
+    std::vector<String> cols = parseCSVLine(line, {0,1,2,3});
+    html += "<tr>";
+    for (String col : cols) {
+      html += "<td>" + col + "</td>";
+    }
+    html += "</tr>";
+  }
+
+  html += "</table>";
+  file.close();
+  server.send(200, "text/html", html);
+}
+
+void handleSDViewStudents() {
+  if (!authenticateUser()) return;
+
+  if (!SD.exists("/students.csv")) {
+    server.send(404, "text/html", "<h2>No student data on SD card!</h2>");
+    return;
+  }
+
+  File file = SD.open("/students.csv");
+  String html = R"(
+    <h2>SD Card Student Data</h2>
+    <table border='1'>
+      <tr><th>ID</th><th>Name</th><th>Roll No</th></tr>
+  )";
+
+  while (file.available()) {
+    String line = file.readStringUntil('\n');
+    std::vector<String> cols = parseCSVLine(line, {0,1,2});
+    html += "<tr>";
+    for (String col : cols) {
+      html += "<td>" + col + "</td>";
+    }
+    html += "</tr>";
+  }
+
+  html += "</table>";
+  file.close();
+  server.send(200, "text/html", html);
+}
+void handleSDDownloadTeachers() {
+  if (!authenticateUser()) return;
+
+  if (!SD.exists("/teachers.csv")) {
+    server.send(404, "text/html", "<h2>File not found!</h2>");
+    return;
+  }
+
+  File file = SD.open("/teachers.csv");
+  server.sendHeader("Content-Disposition", "attachment; filename=teachers_sd.csv");
+  server.streamFile(file, "text/csv");
+  file.close();
+}
+void handleSDDownloadStudents() {
+  if (!authenticateUser()) return;
+
+  if (!SD.exists("/students.csv")) {
+    server.send(404, "text/html", "<h2>File not found!</h2>");
+    return;
+  }
+
+  File file = SD.open("/students.csv");
+  server.sendHeader("Content-Disposition", "attachment; filename=students_sd.csv");
+  server.streamFile(file, "text/csv");
+  file.close();
+}
+void handleSDDownloadAttendance() {
+  if (!authenticateUser()) return;
+
+  if (!SD.exists("/attendance.csv")) {
+    server.send(404, "text/html", "<h2>No attendance data on SD!</h2>");
+    return;
+  }
+
+  File file = SD.open("/attendance.csv");
+  server.sendHeader("Content-Disposition", "attachment; filename=full_attendance.csv");
+  server.streamFile(file, "text/csv");
+  file.close();
+}
+
+// Repeat similarly for handleSDDownloadStudents() and handleSDDownloadAttendance()
 //55
 void handleDownloadOfflineData() {
     // Attempt to open the offline attendance file
@@ -3727,16 +2922,20 @@ void setupWebServerRoutes() {
         server.send(200, "text/html", "<h2>Student enrolled successfully!</h2>");
     });
     server.on("/downloadStudents", HTTP_GET, handleDownloadStudents);
-  //  server.on("/attendancemode", HTTP_GET, handleattendancemode);
+
     server.on("/deleteAllFiles", HTTP_GET, handleDeleteAllCSVFiles);
-    server.on("/downloadAttendance", HTTP_GET, handleDownloadAttendance);
-    server.on("/viewAttendance", HTTP_GET, handleViewAttendance);
-    server.on("/attendanceDetails", HTTP_GET, handleAttendanceDetails);
-    server.on("/datewiseAttendance", HTTP_GET, handleDatewiseAttendance);
-    server.on("/datewiseDownload", handleDateWiseDownload);
-    //server.on("/downloadAttendance25", handleDownloadAttendance25);
-    server.on("/downloadDateAttendance", HTTP_GET, handleDownloadDateAttendance);
+
     server.on("/downloadOfflineData", HTTP_GET, handleDownloadOfflineData);
+    server.on("/offline_attendance.csv", HTTP_GET, handleFileRequest);
+    server.on("/sdImportTeachers", HTTP_GET, handleSDImportTeachers);
+server.on("/sdViewTeachers", HTTP_GET, handleSDViewTeachers);
+server.on("/sdDownloadTeachers", HTTP_GET, handleSDDownloadTeachers);
+
+server.on("/sdImportStudents", HTTP_GET, handleSDImportStudents);
+server.on("/sdViewStudents", HTTP_GET, handleSDViewStudents);
+server.on("/sdDownloadStudents", HTTP_GET, handleSDDownloadStudents);
+
+server.on("/sdDownloadAttendance", HTTP_GET, handleSDDownloadAttendance);
 }
 
 
@@ -3792,6 +2991,8 @@ void setup() {
             startAccessPoint(); // Start Access Point if connection fails
         }
     }
+     // Ensure Wi-Fi is connected
+    
 
     // Set up web server routes
     setupWebServerRoutes();  // Moved all routes to a separate function for better organization
@@ -3819,11 +3020,14 @@ void setup() {
     } else {
         Serial.println("RTC initialized.");
     }
-
+     
     // Optional: Display a final ready message
     lcd.clear();
     lcd.print("System Ready");
     Serial.println("System setup completed successfully.");
+    checkWiFiConnection();
+
+
 }
 
 
@@ -3832,6 +3036,7 @@ void setup() {
 //clint Server Handle with online check and key for attendance
 void checkWiFiConnection() {
     if (WiFi.status() != WL_CONNECTED) {
+        offlineDataSent = false; // Reset flag when Wi-Fi connection is lost
         Serial.println("Wi-Fi not connected. Attempting to reconnect...");
         WiFi.reconnect();  // Try reconnecting
         delay(5000);  // Wait 5 seconds before trying again
@@ -3860,18 +3065,31 @@ void handleKeypadInput() {
         }
     }
 }
-
+void handleFileRequest() {
+    if (SPIFFS.exists("/offline_attendance.csv")) {
+        File file = SPIFFS.open("/offline_attendance.csv", "r");
+        server.streamFile(file, "text/csv"); // Set the correct MIME type for CSV
+        file.close();
+    } else {
+        server.send(404, "text/plain", "File not found"); // Send a 404 response if the file doesn't exist
+    }
+}
 // Main loop
 void loop() {
+   String* taskData;
+    if (xQueueReceive(supabaseQueue, &taskData, 0) == pdTRUE) {
+        sendToSupabase("students", "", "DELETE", taskData->toInt());
+        delete taskData;
+    }
     server.handleClient();  // Handle web server client requests
     delay(1);  // Prevent blocking
 
-    checkWiFiConnection();  // Periodically check Wi-Fi status
-
-    // Send offline data to Supabase if Wi-Fi is connected
+  
     if (WiFi.status() == WL_CONNECTED) {
-        sendOfflineDataToSupabase();  // Send offline data asynchronously
+        // Save the last time we sent data
+        sendOfflineDataToSupabase(); // Attempt to send offline data
     }
+    
 
     handleKeypadInput();  // Process keypad input without blocking
 
